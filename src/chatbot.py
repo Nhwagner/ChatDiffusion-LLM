@@ -1,7 +1,7 @@
 import torch
 from transformers import AutoTokenizer, AutoModel
 from models import CheckpointedLLaDAModelLM
-from generation import differentiable_generation, classical_generation
+from generation import differentiable_generation, classic_generation
 from utils import live_progress_callback
 import time
 
@@ -18,24 +18,40 @@ def build_chat_prompt(conversation, add_generation_prompt=True):
         prompt += "Assistant: "
     return prompt
 
-def chatbot():
+def chatbot(sampling="classic", model_name="GSAI-ML/LLaDA-8B-Instruct",
+            gen_length=64, block_length=32, steps=64, temperature=0.0, cfg_scale=0.0):
     """
-    Chatbot loop with a clean display.
+    Chatbot loop with configurable generation parameters.
+    
+    This function initializes the language model and tokenizer, sets up the generation 
+    method (differentiable or classic), and enters an interactive loop. The user input 
+    is used to build a conversation prompt, and the model generates a response using the 
+    specified generation method. The progress callback is used to provide live progress updates.
+    
+    Parameters:
+      - sampling: "diff" for differentiable generation, any other value for classic generation.
+      - model_name: Name or path of the pre-trained model.
+      - gen_length: Number of tokens to generate for the response.
+      - block_length: Number of tokens processed together as a block.
+      - steps: Total generation steps (must align with block configuration).
+      - temperature: Temperature value for stochastic sampling (via Gumbel noise).
+      - cfg_scale: Classifier-free guidance scale.
     """
-    sampling = "diff"  # Choose between "diff" or "classical"
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     model = AutoModel.from_pretrained(
-        'GSAI-ML/LLaDA-8B-Instruct',
+        model_name,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16
     ).to(device)
     
     tokenizer = AutoTokenizer.from_pretrained(
-        'GSAI-ML/LLaDA-8B-Instruct',
+        model_name,
         trust_remote_code=True
     )
-    
+
+    # If differentiable sampling is selected, wrap the model with checkpointing logic.
     if sampling == "diff":
         model = CheckpointedLLaDAModelLM(model)
 
@@ -56,40 +72,44 @@ def chatbot():
             delattr(live_progress_callback, "first_call")
         live_progress_callback.first_call = True
         live_progress_callback.last_len = 0
-
+        
+        # Generate a response using the selected sampling method.
         if sampling == "diff":
             final_x, _ = differentiable_generation(
                 model=model,
                 tokenizer=tokenizer,
                 prompt_ids=prompt_ids,
-                gen_length=32,
-                block_length=8,
-                steps=16,
+                gen_length=gen_length,
+                block_length=block_length,
+                steps=steps,
                 score_model=model,
                 score_weight=1.0,
                 lr=1e-2,
-                temperature=0.,
+                temperature=temperature,
                 remasking='low_confidence',
                 progress_callback=live_progress_callback,
-                cfg_scale=0.
+                cfg_scale=cfg_scale
             )
         else:
-            final_x = classical_generation(
+            final_x = classic_generation(
                 model=model,
                 tokenizer=tokenizer,
                 prompt=prompt_ids,
-                gen_length=64,
-                block_length=32,
-                steps=64,
-                temperature=0.,
+                gen_length=gen_length,
+                block_length=block_length,
+                steps=steps,
+                temperature=temperature,
                 remasking='low_confidence',
                 progress_callback=live_progress_callback,
-                cfg_scale=0.
+                cfg_scale=cfg_scale
             )
-        
+        # Decode the generated tokens into text.
         generated_tokens = final_x[0, prompt_ids.shape[1]:]
         output_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        # Append the assistant's response to the conversation history.
         conversation.append({"role": "assistant", "content": output_text})
         print("")
+        
+        # If using differentiable generation, we exit after one response
         if sampling == "diff":
             break
