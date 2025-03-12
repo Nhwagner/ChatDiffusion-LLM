@@ -5,31 +5,6 @@ import sys
 import shutil
 import math
 
-def add_gumbel_noise(logits, temperature):
-    """
-    Add Gumbel noise to logits for sampling.
-    """
-    if temperature == 0:
-        return logits
-    logits = logits.to(torch.float64)
-    noise = torch.rand_like(logits, dtype=torch.float64)
-    gumbel_noise = (-torch.log(noise)) ** temperature
-    return logits.exp() / gumbel_noise
-
-
-def get_num_transfer_tokens(mask_index, steps):
-    """
-    Precompute number of tokens to update at each step.
-    """
-    mask_num = mask_index.sum(dim=1, keepdim=True)
-    base = mask_num // steps
-    remainder = mask_num % steps
-    num_transfer_tokens = torch.zeros(mask_num.size(0), steps, device=mask_index.device, dtype=torch.int64) + base
-    for i in range(mask_num.size(0)):
-        num_transfer_tokens[i, :remainder[i]] += 1
-    return num_transfer_tokens
-
-
 #https://github.com/ML-GSAI/LLaDA/blob/main/generate.py
 def add_gumbel_noise(logits, temperature):
     '''
@@ -65,12 +40,25 @@ def get_num_transfer_tokens(mask_index, steps):
 
     return num_transfer_tokens
 
-
-
-
-
-
-
+def sentiment_guidance_loss(sentiment_output, target_label=1):
+    """
+    Computes a sentiment loss for the given input token IDs.
+    
+    Parameters:
+    - sentiment_output (torch.Tensor): output of sentiment model
+    - target_label (int): The desired sentiment class (e.g., 1 for positive, 0 for negative).
+    
+    Returns:
+    - loss (torch.Tensor): A scalar loss value which can be backpropagated.
+    """
+    logits = sentiment_output.logits  # Shape: [batch, num_labels]
+    
+    # Create a target tensor with the desired sentiment label.
+    target = torch.full((logits.shape[0],), target_label, dtype=torch.long, device=logits.device)
+    
+    # Compute cross entropy loss.
+    loss = F.cross_entropy(logits, target)
+    return loss
 
 def live_progress_callback(current_step, total_steps, x, prompt_len, tokenizer, mask_id):
     """

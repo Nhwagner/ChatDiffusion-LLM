@@ -2,10 +2,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time
-from utils import add_gumbel_noise, get_num_transfer_tokens
+from utils import add_gumbel_noise, get_num_transfer_tokens, sentiment_guidance_loss
 
+class ProjectionLayer(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.proj = nn.Linear(input_dim, output_dim)
 
-def compute_combined_logits(model, x, delta, block_indices, score_model, score_weight, cfg_scale, mask_id):
+    def forward(self, x):
+        return self.proj(x)
+
+def compute_combined_logits(model, x, delta, block_indices, cfg_scale, mask_id):
     """
     Compute model logits with optional classifier-free guidance and add delta.
     
@@ -18,14 +25,11 @@ def compute_combined_logits(model, x, delta, block_indices, score_model, score_w
       - x: Input token tensor (includes prompt and masked tokens).
       - delta: Learnable offset tensor, added to adjust logits.
       - block_indices: Indices for the current block of tokens to update.
-      - score_model: Optional auxiliary model for scoring.
-      - score_weight: Scalar weight for the score model logits.
       - cfg_scale: Classifier-free guidance scale.
       - mask_id: Token id that indicates a masked token.
     
     Returns:
       - combined_logits: Logits adjusted with guidance and delta.
-      - scorer_logits: Logits from the score model (or detached main logits if score_model is None).
     """
     if cfg_scale > 0.:
         # Identify prompt positions where tokens are not masked.
@@ -45,14 +49,11 @@ def compute_combined_logits(model, x, delta, block_indices, score_model, score_w
         # If no guidance is used, simply get the logits from the model.
         main_logits = model(x).logits
 
-    # Use the score model's logits if provided; otherwise, detach main_logits to avoid affecting gradients.
-    scorer_logits = score_model(x).logits if score_model is not None else main_logits.detach()
     # Create a copy of the main logits to modify.
     combined_logits = main_logits.clone()
     # Add weighted score model logits and delta adjustments only at the active block positions.
-    combined_logits[:, block_indices] += (score_weight * scorer_logits[:, block_indices] + delta[:, block_indices])
-    return combined_logits, scorer_logits
-
+    combined_logits[:, block_indices] += delta[:, block_indices]
+    return combined_logits
 
 def gradient_update_step(combined_logits, scorer_logits, block_indices):
     """
@@ -154,17 +155,21 @@ def update_block(x, block_indices, x0, x0_p, num_transfer_tokens, step, mask_id)
         updated_block = x[:, block_indices].clone()
         updated_block[transfer_index] = x0[transfer_index]
         x[:, block_indices] = updated_block
+
+    
     return x
-
-
 
 def differentiable_generation(model,
                               tokenizer,
                               prompt_ids,
+                              score_prompt = None,
+                              mode = "sentiment", #"sentiment", "LLM"
+                              sentiment_label = 0,
                               gen_length=64,
                               block_length=16,
                               steps=16,
                               score_model=None,
+                              score_tokenizer=None,
                               score_weight=1.0,
                               mask_id=126336,
                               lr=1e-2,
@@ -184,6 +189,8 @@ def differentiable_generation(model,
       - tokenizer: Tokenizer for converting tokens (used in progress callback).
       - prompt_ids: Initial prompt token ids.
       - gen_length: Number of tokens to generate.
+      - score prompt: The tokens which will augment the output
+      - mode: sentiment for sentiment signal, LLM for KL divergence
       - block_length: Number of tokens in each block.
       - steps: Total number of update steps (must be a multiple of the number of blocks).
       - score_model: Optional auxiliary model for scoring.
@@ -199,10 +206,24 @@ def differentiable_generation(model,
       - x: Final generated token sequence.
       - delta: Optimized delta parameter tensor.
     """
+    class ProjectionLayer(nn.Module):
+      def __init__(self, input_dim, output_dim):
+          super().__init__()
+          self.proj = nn.Linear(input_dim, output_dim)
+
+      def forward(self, x):
+          return self.proj(x)
+    
     device = prompt_ids.device
+
+    if mode == "sentiment":
+        projection = ProjectionLayer(4096, 768).to(device)
+        projection = projection.to(model.dtype)
     batch_size = prompt_ids.shape[0]
     prompt_len = prompt_ids.shape[1]
     total_len = prompt_len + gen_length
+
+    score_prompt_ids = tokenizer(score_prompt, return_tensors="pt").input_ids.to(device)
 
     # Initialize token sequence with all positions set to mask_id and then fill in the prompt.
     x = torch.full((batch_size, total_len), mask_id, dtype=torch.long, device=device)
@@ -226,6 +247,7 @@ def differentiable_generation(model,
 
     # Process generation block by block.
     for block_i in range(num_blocks):
+        
         # Define the token indices for the current block.
         block_start = prompt_len + block_i * block_length
         block_end = prompt_len + (block_i + 1) * block_length
@@ -237,19 +259,39 @@ def differentiable_generation(model,
 
         # Iterate over the steps for the current block.
         for step in range(steps_per_block):
-            optimizer.zero_grad()
+
             # Compute logits with classifier-free guidance and add delta.
-            combined_logits, scorer_logits = compute_combined_logits(
-                model, x, delta, block_indices, score_model, score_weight, cfg_scale, mask_id
+            combined_logits = compute_combined_logits(
+                model, x, delta, block_indices, cfg_scale, mask_id
             )
-            # Compute the KL divergence loss between the modified logits and the score logits.
-            loss = gradient_update_step(combined_logits, scorer_logits, block_indices)
-            # Backpropagate the loss to update delta.
-            loss.backward()
-            optimizer.step()
 
             # Sample new token predictions and compute their confidence scores.
             x0, x0_p = sample_block(combined_logits, block_indices, temperature, mask_id, remasking)
+            
+            if mode == "sentiment":
+
+                #Calculate sentiment score
+                probs = torch.softmax(combined_logits, dim=-1)
+                embedding_matrix = model.model.transformer.wte.weight
+                weighted_embedding = torch.matmul(probs, embedding_matrix)
+                projected_emb = projection(weighted_embedding)
+                sentiment_outputs = score_model(inputs_embeds=projected_emb)
+
+            if mode == "sentiment":
+                #Apply sentiment loss, to update delta
+                loss = sentiment_guidance_loss(sentiment_outputs, target_label=sentiment_label)
+                
+            else:
+                # Compute the KL divergence loss between the modified logits and the score logits.
+                score_input = torch.cat([score_prompt_ids, x], dim = 1)
+                scorer_logits = model(score_input).logits[:,score_prompt_ids.shape[1]:]
+                loss = gradient_update_step(combined_logits, scorer_logits, block_indices)
+
+            # Backpropagate the loss to update delta.
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
             # Update the token sequence x based on the new predictions and confidence.
             x = update_block(x, block_indices, x0, x0_p, num_transfer_tokens, step, mask_id)
 
@@ -331,6 +373,7 @@ def classic_generation(model,
                 # Concatenate original and null inputs.
                 x_ = torch.cat([x, un_x], dim=0)
                 # Compute logits and split into guided components.
+    
                 logits = model(x_).logits
                 logits, un_logits = torch.chunk(logits, 2, dim=0)
                 logits = un_logits + (cfg_scale + 1) * (logits - un_logits)

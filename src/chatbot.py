@@ -1,5 +1,5 @@
 import torch
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 from models import CheckpointedLLaDAModelLM
 from generation import differentiable_generation, classic_generation
 from utils import live_progress_callback
@@ -18,8 +18,9 @@ def build_chat_prompt(conversation, add_generation_prompt=True):
         prompt += "Assistant: "
     return prompt
 
-def chatbot(sampling="classic", model_name="GSAI-ML/LLaDA-8B-Instruct",
-            gen_length=64, block_length=32, steps=64, temperature=0.0, cfg_scale=0.0):
+def chatbot(sampling="classic", mode="sentiment", sentiment_label=1, model_name="GSAI-ML/LLaDA-8B-Instruct",
+            gen_length=64, block_length=32, steps=64, temperature=0.0, cfg_scale=0.0,
+            sentiment_model_name = "distilbert-base-uncased-finetuned-sst-2-english", score_prompt="Think Carefully"):
     """
     Chatbot loop with configurable generation parameters.
     
@@ -51,9 +52,17 @@ def chatbot(sampling="classic", model_name="GSAI-ML/LLaDA-8B-Instruct",
         trust_remote_code=True
     )
 
+
     # If differentiable sampling is selected, wrap the model with checkpointing logic.
     if sampling == "diff":
-        model = CheckpointedLLaDAModelLM(model)
+        if mode == "sentiment":
+            score_model = AutoModelForSequenceClassification.from_pretrained(sentiment_model_name, torch_dtype=torch.bfloat16).to(device)
+            score_model.gradient_checkpointing_enable()
+            score_tokenizer = AutoTokenizer.from_pretrained(sentiment_model_name)
+        else:
+            model = CheckpointedLLaDAModelLM(model)
+            score_model = None
+            score_tokenizer = None
 
     conversation = []
     print("Chatbot initialized. Type 'exit' or 'quit' to stop.")
@@ -78,11 +87,15 @@ def chatbot(sampling="classic", model_name="GSAI-ML/LLaDA-8B-Instruct",
             final_x, _ = differentiable_generation(
                 model=model,
                 tokenizer=tokenizer,
-                prompt_ids=prompt_ids,
+                prompt_ids = prompt_ids,
+                mode=mode,
+                sentiment_label=sentiment_label,
+                score_prompt=score_prompt,
                 gen_length=gen_length,
                 block_length=block_length,
                 steps=steps,
-                score_model=model,
+                score_model=score_model,
+                score_tokenizer=score_tokenizer,
                 score_weight=1.0,
                 lr=1e-2,
                 temperature=temperature,
